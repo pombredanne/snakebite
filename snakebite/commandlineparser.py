@@ -465,3 +465,9 @@ class CommandLineParser(object):
             sys.exit(0)
         else:
             sys.exit(1)
+
+    @command(args="[paths]", descr="cat", allowed_opts=[], req_args=['dir [dirs]'])
+    def cat(self):
+        result = self.client.cat(self.args)
+        for line in result:
+            print line
