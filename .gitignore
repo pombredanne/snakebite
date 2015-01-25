@@ -8,3 +8,8 @@ build/
 snakebite.egg-info/
 MANIFEST
 dist/
+.tox
+*.swp
+.DS_Store
+doc/html
+doc/doctrees

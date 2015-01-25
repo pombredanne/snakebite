@@ -24,9 +24,8 @@ class SnakebiteCli(object):
     def __init__(self):
         clparser = CommandLineParser()
         self.args = clparser.parse()
-        clparser.read_config()
-        clparser.setup_client(self.args.namenode, int(self.args.port), int(self.args.version))
         self._setup_logging()
+        clparser.init()
         clparser.execute()
 
     def _setup_logging(self):

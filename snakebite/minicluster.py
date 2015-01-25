@@ -37,14 +37,14 @@ class MiniCluster(object):
     Example without :mod:`snakebite.client <client>`
 
     >>> from snakebite.minicluster import MiniCluster
-    >>> cluster = Minicluster("/path/to/test/files")
+    >>> cluster = MiniCluster("/path/to/test/files")
     >>> ls_output = cluster.ls(["/"])
 
     Example with :mod:`snakebite.client <client>`
 
     >>> from snakebite.minicluster import MiniCluster
     >>> from snakebite.client import Client
-    >>> cluster = Minicluster("/path/to/test/files")
+    >>> cluster = MiniCluster("/path/to/test/files")
     >>> client = Client('localhost', cluster.port)
     >>> ls_output = client.ls(["/"])
 
@@ -57,19 +57,24 @@ class MiniCluster(object):
     .. note:: Not all hadoop commands have been implemented, only the ones that
               were necessary for testing the snakebite client, but please feel free to add them
     '''
-    def __init__(self, testfiles_path):
+    def __init__(self, testfiles_path, start_cluster=True, nnport=None):
         '''
         :param testfiles_path: Local path where test files can be found. Mainly used for ``put()``
         :type testfiles_path: string
+        :param start_cluster: start a MiniCluster on initialization. If False, this class will act as an interface to the ``hadoop fs`` command
+        :type start_cluster: boolean
         '''
         self._testfiles_path = testfiles_path
         self._hadoop_home = os.environ['HADOOP_HOME']
         self._jobclient_jar = os.environ.get('HADOOP_JOBCLIENT_JAR')
         self._hadoop_cmd = "%s/bin/hadoop" % self._hadoop_home
-        self._start_mini_cluster()
-        self.host = "localhost"
-        self.port = self._get_namenode_port()
-        self.hdfs_url = "hdfs://%s:%d" % (self.host, self.port)
+        if start_cluster:
+            self._start_mini_cluster(nnport)
+            self.host = "localhost"
+            self.port = self._get_namenode_port()
+            self.hdfs_url = "hdfs://%s:%d" % (self.host, self.port)
+        else:
+            self.hdfs_url = "hdfs://"
 
     def terminate(self):
         ''' Terminate the cluster
@@ -85,54 +90,82 @@ class MiniCluster(object):
         This will take a file from the ``testfiles_path`` supplied in the constuctor.
         '''
         src = "%s%s" % (self._testfiles_path, src)
-        return self._runCmd([self._hadoop_cmd, 'fs', '-put', src, self._full_hdfs_path(dst)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-put', src, self._full_hdfs_path(dst)])
 
-    def put_subprocess(self, src, dst):  # This is used for testing with large files.
-        cmd = [self._hadoop_cmd, 'fs', '-put', src, self._full_hdfs_path(dst)]
+    def put_subprocess(self, src, dst, block_size=134217728):  # This is used for testing with large files.
+        block_size_flag = "-Ddfs.block.size=%s" % str(block_size)
+        cmd = [self._hadoop_cmd, 'fs', block_size_flag, '-put', src, self._full_hdfs_path(dst)]
         return subprocess.Popen(cmd, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+
+    def exists(self, path):
+        """Return True if <src> exists, False if doesn't"""
+        return self._getReturnCodeCmd([self._hadoop_cmd, 'fs', '-test', '-e', path]) == 0
+
+    def is_directory(self, path):
+        """Return True if <path> is a directory, False if it's NOT a directory"""
+        return self._getReturnCodeCmd([self._hadoop_cmd, 'fs', '-test', '-d', self._full_hdfs_path(path)]) == 0
+
+    def is_files(self, path):
+        """Return True if <path> is a file, False if it's NOT a file"""
+        return self._getReturnCodeCmd([self._hadoop_cmd, 'fs', '-test', '-f', self._full_hdfs_path(path)]) == 0
+
+    def is_greater_then_zero_bytes(self, path):
+        """Return True if file <path> is greater than zero bytes in size, False otherwise"""
+        return self._getReturnCodeCmd([self._hadoop_cmd, 'fs', '-test', '-s', self._full_hdfs_path(path)]) == 0
+
+    def is_zero_bytes_file(self, path):
+        """Return True if file <path> is zero bytes in size, else return False"""
+        return self._getReturnCodeCmd([self._hadoop_cmd, 'fs', '-test', '-z', self._full_hdfs_path(path)]) == 0
 
     def ls(self, src, extra_args=[]):
         '''List files in a directory'''
         src = [self._full_hdfs_path(x) for x in src]
-        output = self._runCmd([self._hadoop_cmd, 'fs', '-ls'] + extra_args + src)
+        output = self._getStdOutCmd([self._hadoop_cmd, 'fs', '-ls'] + extra_args + src)
         return self._transform_ls_output(output, self.hdfs_url)
 
     def mkdir(self, src, extra_args=[]):
         '''Create a directory'''
-        return self._runCmd([self._hadoop_cmd, 'fs', '-mkdir'] + extra_args + [self._full_hdfs_path(src)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-mkdir'] + extra_args + [self._full_hdfs_path(src)])
 
     def df(self, src):
         '''Perform ``df`` on a path'''
-        return self._runCmd([self._hadoop_cmd, 'fs', '-df', self._full_hdfs_path(src)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-df', self._full_hdfs_path(src)])
 
     def du(self, src, extra_args=[]):
         '''Perform ``du`` on a path'''
         src = [self._full_hdfs_path(x) for x in src]
-        return self._transform_du_output(self._runCmd([self._hadoop_cmd, 'fs', '-du'] + extra_args + src), self.hdfs_url)
+        return self._transform_du_output(self._getStdOutCmd([self._hadoop_cmd, 'fs', '-du'] + extra_args + src), self.hdfs_url)
 
     def count(self, src):
         '''Perform ``count`` on a path'''
         src = [self._full_hdfs_path(x) for x in src]
-        return self._transform_count_output(self._runCmd([self._hadoop_cmd, 'fs', '-count'] + src), self.hdfs_url)
+        return self._transform_count_output(self._getStdOutCmd([self._hadoop_cmd, 'fs', '-count'] + src), self.hdfs_url)
 
     def cat(self, src, extra_args=[]):
-        return self._runCmd([self._hadoop_cmd, 'fs', '-cat'] + extra_args + [self._full_hdfs_path(src)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-cat'] + extra_args + [self._full_hdfs_path(src)])
 
     def copyToLocal(self, src, dst, extra_args=[]):
-        return self._runCmd([self._hadoop_cmd, 'fs', '-copyToLocal'] + extra_args + [self._full_hdfs_path(src), dst])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-copyToLocal'] + extra_args + [self._full_hdfs_path(src), dst])
 
     def getmerge(self, src, dst, extra_args=[]):
-        return self._runCmd([self._hadoop_cmd, 'fs', '-getmerge'] + extra_args + [self._full_hdfs_path(src), dst])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-getmerge'] + extra_args + [self._full_hdfs_path(src), dst])
 
     def tail(self, src, extra_args=[]):
-        return self._runCmd([self._hadoop_cmd, 'fs', '-tail'] + extra_args + [self._full_hdfs_path(src)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-tail'] + extra_args + [self._full_hdfs_path(src)])
 
     def text(self, src):
-        return self._runCmd([self._hadoop_cmd, 'fs', '-text', self._full_hdfs_path(src)])
+        return self._getStdOutCmd([self._hadoop_cmd, 'fs', '-text', self._full_hdfs_path(src)])
 
-    def _runCmd(self, cmd):
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return p.communicate()[0]
+    def _getReturnCodeCmd(self, cmd):
+        proc = self._getCmdProcess(cmd)
+        print proc.communicate()
+        return proc.wait()
+
+    def _getCmdProcess(self, cmd):
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _getStdOutCmd(self, cmd):
+        return self._getCmdProcess(cmd).communicate()[0]
 
     def _full_hdfs_path(self, src):
         return "%s%s" % (self.hdfs_url, src)
@@ -143,23 +176,22 @@ class MiniCluster(object):
                 if re.match(".*hadoop-mapreduce-client-jobclient.+-tests.jar", files):
                     return os.path.join(dirpath, files)
 
-    def _start_mini_cluster(self):
+    def _start_mini_cluster(self, nnport=None):
         if self._jobclient_jar:
             hadoop_jar = self._jobclient_jar
         else:
             hadoop_jar = self._find_mini_cluster_jar(self._hadoop_home)
         if not hadoop_jar:
             raise Exception("No hadoop jobclient test jar found")
-        self.hdfs = subprocess.Popen([self._hadoop_cmd,
-                                      'jar',
-                                      hadoop_jar,
-                                      'minicluster', '-nomr', '-format'],
-                                      bufsize=0,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        cmd = [self._hadoop_cmd, 'jar', hadoop_jar,
+               'minicluster', '-nomr', '-format']
+        if nnport:
+            cmd.extend(['-nnport', "%s" % nnport])
+        self.hdfs = subprocess.Popen(cmd, bufsize=0, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
 
     def _get_namenode_port(self):
-        port_found = False
-        while self.hdfs.poll() is None and not port_found:
+        while self.hdfs.poll() is None:
             rlist, wlist, xlist = select.select([self.hdfs.stderr, self.hdfs.stdout], [], [])
             for f in rlist:
                 line = f.readline()
@@ -196,8 +228,17 @@ class MiniCluster(object):
         result = []
         for line in i.split("\n"):
             if line:
-                (length, path) = re.split("\s+", line)
-                result.append({"path": path.replace(base_path, ""), "length": long(length)})
+                fields = re.split("\s+", line)
+                if len(fields) == 3:
+                    (length, space_consumed, path) = re.split("\s+", line)
+                elif len(fields) == 2:
+                    (length, path) = re.split("\s+", line)
+                else:
+                    raise ValueError("Result of du operation should contain 2"
+                                     " or 3 field, but there's %d fields"
+                                     % len(fields))
+                result.append({"path": path.replace(base_path, ""),
+                               "length": long(length)})
         return result
 
     def _transform_count_output(self, i, base_path):

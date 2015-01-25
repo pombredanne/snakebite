@@ -18,10 +18,9 @@ import sys
 import os
 import pwd
 import json
-import xml.etree.ElementTree as ET
 from urlparse import urlparse
 
-from snakebite.client import Client
+from snakebite.client import HAClient
 from snakebite.errors import FileNotFoundException
 from snakebite.errors import DirectoryException
 from snakebite.errors import FileException
@@ -32,17 +31,28 @@ from snakebite.formatter import format_counts
 from snakebite.formatter import format_fs_stats
 from snakebite.formatter import format_stat
 from snakebite.formatter import format_du
+from snakebite.config import HDFSConfig
+from snakebite.version import version
+from snakebite.namenode import Namenode
 
 
-def exitError(error):
-    if isinstance(error, FileNotFoundException) or \
-       isinstance(error, DirectoryException) or \
-       isinstance(error, FileException):
-        print str(error)
-    elif isinstance(error, RequestError):
-        print "Request error: %s" % str(error)
+def print_error_exit(msg, fd=sys.stderr):
+    print >> fd, "Error: %s" % msg
+    sys.exit(-1)
+
+def print_info(msg, fd=sys.stderr):
+    print >> fd, "Info: %s" % msg
+
+def exitError(exc_info):
+    exc_type, exc_value, exc_traceback = exc_info
+    if isinstance(
+        exc_value, (FileNotFoundException, DirectoryException, FileException),
+    ):
+        print str(exc_value)
+    elif isinstance(exc_value, RequestError):
+        print "Request error: %s" % str(exc_value)
     else:
-        raise error
+        raise exc_type, exc_value, exc_traceback
     sys.exit(-1)
 
 
@@ -93,17 +103,21 @@ class CommandLineParser(object):
                           "type": str},
                     'V': {"short": '-V',
                           "long": '--version',
-                          "help": 'Hadoop protocol version (default:8)',
-                          "default": 7,
+                          "help": 'Hadoop protocol version (default:%d)' % Namenode.DEFAULT_VERSION,
+                          "default": Namenode.DEFAULT_VERSION,
                           "type": float},
                     'p': {"short": '-p',
                           "long": '--port',
-                          "help": 'namenode RPC port',
+                          "help": 'namenode RPC port (default: %d)' % Namenode.DEFAULT_PORT,
                           "type": int},
-                    'H': {"short": '-h',
-                          "long": '--human',
-                          "help": 'human readable output',
-                          "action": 'store_true'}
+                    'h': {"short": '-h',
+                          "long": '--help',
+                          "help": 'show help',
+                          "type": int},
+                    'v': {"short": '-v',
+                          "long": '--ver',
+                          "help": 'Display snakebite version',
+                          "type": int}
                     }
 
     SUB_OPTS = {'R': {"short": '-R',
@@ -117,6 +131,15 @@ class CommandLineParser(object):
                 's': {"short": '-s',
                       "long": '--summary',
                       "help": 'print summarized output',
+                      "action": 'store_true'},
+                'S': {"short": '-S',
+                      "long": '--skiptrash',
+                      "help": 'skip the trash (when trash is enabled)',
+                      "default": False,
+                      "action": 'store_true'},
+                'T': {"short": '-T',
+                      "long": "--usetrash",
+                      "help": "enable the trash",
                       "action": 'store_true'},
                 'z': {"short": '-z',
                       "long": '--zero',
@@ -135,8 +158,12 @@ class CommandLineParser(object):
                       "help": 'show appended data as the file grows',
                       "action": 'store_true'},
                 'nl': {"short": '-nl',
-                      "long": "--newline",
-                      "help": 'add a newline character at the end of each file.',
+                       "long": "--newline",
+                       "help": 'add a newline character at the end of each file.',
+                       "action": 'store_true'},
+                'h': {"short": '-h',
+                      "long": '--human',
+                      "help": 'human readable output',
                       "action": 'store_true'}
                 }
 
@@ -151,6 +178,7 @@ class CommandLineParser(object):
         self.parser = Parser(usage=usage, epilog=epilog, formatter_class=argparse.RawTextHelpFormatter, add_help=False)
         self._build_parent_parser()
         self._add_subparsers()
+        self.namenodes = []
 
     def _build_parent_parser(self):
         #general options
@@ -214,78 +242,163 @@ class CommandLineParser(object):
             command_parser = subparsers.add_parser(cmd_name, add_help=False, parents=parents)
             command_parser.set_defaults(command=cmd_name)
 
-    def read_config(self):
-        ''' Check if any directory arguments contain hdfs://'''
-        if self.args and 'dir' in self.args:
-            dirs_to_check = self.args.dir
-            if self.args.command == 'mv':
-                dirs_to_check.append(self.args.single_arg)
-            for directory in dirs_to_check:
-                if 'hdfs://' in directory:
-                    parse_result = urlparse(directory)
-                    if not self.args.namenode is None and not self.args.port is None and (self.args.port != parse_result.port or self.args.namenode != parse_result.hostname):
-                        print "error: conflicting nodenames or ports"
-                        sys.exit(-1)
-                    else:
-                        self.args.namenode = parse_result.hostname
-                        self.args.port = parse_result.port
-                        directory = parse_result.path
+    def init(self):
+        self.read_config()
+        self._clean_args()
+        self.setup_client()
 
-        if self.args.namenode and self.args.port:
+    def _clean_args(self):
+        for path in self.__get_all_directories():
+            if path.startswith('hdfs://'):
+                parse_result = urlparse(path)
+                if path in self.args.dir:
+                    self.args.dir.remove(path)
+                    self.args.dir.append(parse_result.path)
+                else:
+                    self.args.single_arg = parse_result.path
+
+    def __usetrash_unset(self):
+        return not 'usetrash' in self.args or self.args.usetrash == False
+
+    def __use_cl_port_first(self, alt):
+        # Port provided from CL has the highest priority:
+        return self.args.port if self.args.port else alt
+
+    def read_config(self):
+
+        # Try to retrieve namenode config from within CL arguments
+        if self._read_config_cl():
             return
 
-        ''' Try to read the config from ~/.snakebiterc and if that doesn't exist, check $HADOOP_HOME/core-site.xml
-        and create a ~/.snakebiterc from that.
-        '''
         config_file = os.path.join(os.path.expanduser('~'), '.snakebiterc')
 
-        try_paths = ['/etc/hadoop/conf/core-site.xml',
-                     '/usr/local/etc/hadoop/conf/core-site.xml',
-                     '/usr/local/hadoop/conf/core-site.xml']
-
         if os.path.exists(config_file):
-            config = json.loads(open(os.path.join(os.path.expanduser('~'), '.snakebiterc')).read())
-            self.args.namenode = config['namenode']
-            self.args.port = config['port']
-            self.args.version = config.get('version', 7)
-        elif os.environ.get('HADOOP_HOME'):
-            hdfs_conf = os.path.join(os.environ['HADOOP_HOME'], 'conf', 'core-site.xml')
-            self._read_hadoop_config(hdfs_conf, config_file)
+            #if ~/.snakebiterc exists - read config from it
+            self._read_config_snakebiterc()
+        elif os.path.exists('/etc/snakebiterc'):
+            self._read_config_snakebiterc('/etc/snakebiterc')
         else:
-            # Try to find other paths
-            for hdfs_conf in try_paths:
-                self._read_hadoop_config(hdfs_conf, config_file)
-                # Bail out on the first find
-                if self.args.namenode and self.args.port:
-                    continue
+            # Try to read the configuration for HDFS configuration files
+            configs = HDFSConfig.get_external_config()
+            # if configs exist and contain something
+            if configs:
+                for config in configs:
+                    nn = Namenode(config['namenode'],
+                                  self.__use_cl_port_first(config['port']))
+                    self.namenodes.append(nn)
+                if self.__usetrash_unset():
+                    self.args.usetrash = HDFSConfig.use_trash
 
-        if self.args.namenode and self.args.port:
+        if len(self.namenodes):
             return
         else:
             print "No ~/.snakebiterc found, no HADOOP_HOME set and no -n and -p provided"
             print "Tried to find core-site.xml in:"
-            for hdfs_conf in try_paths:
-                print " - %s" % hdfs_conf
+            for core_conf_path in HDFSConfig.core_try_paths:
+                print " - %s" % core_conf_path
+            print "Tried to find hdfs-site.xml in:"
+            for hdfs_conf_path in HDFSConfig.hdfs_try_paths:
+                print " - %s" % hdfs_conf_path
             print "\nYou can manually create ~/.snakebiterc with the following content:"
-            print '{"namenode": "ip/hostname", "port": 54310, "version": 7}'
+            print '{'
+            print '  "config_version": 2,'
+            print '  "use_trash": true,'
+            print '  "namenodes": ['
+            print '    {"host": "namenode-ha1", "port": %d, "version": %d},' % (Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
+            print '    {"host": "namenode-ha2", "port": %d, "version": %d}' % (Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
+            print '  ]'
+            print '}'
+
             sys.exit(1)
 
-    def _read_hadoop_config(self, hdfs_conf, config_file):
-        if os.path.exists(hdfs_conf):
-            tree = ET.parse(hdfs_conf)
-            root = tree.getroot()
-            for p in root.findall("./property"):
-                if p.findall('name')[0].text == 'fs.defaultFS':
-                    parse_result = urlparse(p.findall('value')[0].text)
+    def _read_config_snakebiterc(self, path = os.path.join(os.path.expanduser('~'), '.snakebiterc')):
+        old_version_info = "You're are using snakebite %s with Trash support together with old snakebiterc, please update/remove your %s file. By default Trash is %s." % (path, version(), 'disabled' if not HDFSConfig.use_trash else 'enabled')
+        with open(path) as config_file:
+            configs = json.load(config_file)
 
-                    # Set config
-                    self.args.namenode = parse_result.hostname
-                    self.args.port = parse_result.port
+        if isinstance(configs, list):
+            # Version 1: List of namenodes
+            # config is a list of namenode(s) - possibly HA
+            for config in configs:
+                nn = Namenode(config['namenode'],
+                              self.__use_cl_port_first(config.get('port', Namenode.DEFAULT_PORT)),
+                              config.get('version', Namenode.DEFAULT_VERSION))
+                self.namenodes.append(nn)
+            if self.__usetrash_unset():
+                # commandline setting has higher priority
+                print_info(old_version_info)
+                # There's no info about Trash in version 1, use default policy:
+                self.args.usetrash = HDFSConfig.use_trash
+        elif isinstance(configs, dict):
+            # Version 2: {}
+            # Can be either new configuration or just one namenode
+            # which was the very first configuration syntax
+            if 'config_version' in configs:
+                # Config version => 2
+                for nn_config in configs['namenodes']:
+                    nn = Namenode(nn_config['host'],
+                                  self.__use_cl_port_first(nn_config.get('port', Namenode.DEFAULT_PORT)),
+                                  nn_config.get('version', Namenode.DEFAULT_VERSION))
+                    self.namenodes.append(nn)
 
-                    # Write config to file
-                    f = open(config_file, "w")
-                    f.write(json.dumps({"namenode": self.args.namenode, "port": self.args.port, "version": self.args.version}))
-                    f.close()
+                if self.__usetrash_unset():
+                    # commandline setting has higher priority
+                    self.args.usetrash = configs.get("use_trash", HDFSConfig.use_trash)
+            else:
+                # config is a single namenode - no HA
+                self.namenodes.append(Namenode(configs['namenode'],
+                                               self.__use_cl_port_first(configs.get('port', Namenode.DEFAULT_PORT)),
+                                               configs.get('version', Namenode.DEFAULT_VERSION)))
+                if self.__usetrash_unset():
+                    # commandline setting has higher priority
+                    print_info(old_version_info)
+                    self.args.usetrash = HDFSConfig.use_trash
+        else:
+            print_error_exit("Config retrieved from %s is corrupted! Remove it!" % path)
+
+    def __get_all_directories(self):
+        if self.args and 'dir' in self.args:
+            dirs_to_check = list(self.args.dir)
+            if self.args.command == 'mv':
+                dirs_to_check.append(self.args.single_arg)
+            return dirs_to_check
+        else:
+            return ()
+
+    def _read_config_cl(self):
+        ''' Check if any directory arguments contain hdfs://'''
+        dirs_to_check = self.__get_all_directories()
+        hosts, ports = [], []
+        for path in dirs_to_check:
+            if path.startswith('hdfs://'):
+                parse_result = urlparse(path)
+                hosts.append(parse_result.hostname)
+                ports.append(parse_result.port)
+
+        # remove duplicates and None from (hosts + self.args.namenode)
+        hosts = filter(lambda x: x != None, set(hosts + [self.args.namenode]))
+        if len(hosts) > 1:
+            print_error_exit('Conficiting namenode hosts in commandline arguments, hosts: %s' % str(hosts))
+
+        ports = filter(lambda x: x != None, set(ports + [self.args.port]))
+        if len(ports) > 1:
+            print_error_exit('Conflicting namenode ports in commandline arguments, ports: %s' % str(ports))
+
+        # Store port from CL in arguments - CL port has the highest priority
+        if len(ports) == 1:
+            self.args.port = ports[0]
+
+        # do we agree on one namenode?
+        if len(hosts) == 1 and len(ports) <= 1:
+            self.args.namenode = hosts[0]
+            self.args.port = ports[0] if len(ports) == 1 else Namenode.DEFAULT_PORT
+            self.namenodes.append(Namenode(self.args.namenode, self.args.port))
+            # we got the info from CL -> check if use_trash is set - if not use default policy:
+            if self.__usetrash_unset():
+                self.args.usetrash = HDFSConfig.use_trash
+            return True
+        else:
+            return False
 
     def parse(self, non_cli_input=None):  # Allow input for testing purposes
         if not sys.argv[1:] and not non_cli_input:
@@ -295,7 +408,7 @@ class CommandLineParser(object):
         try:
             args = self.parser.parse_args(non_cli_input)
         except ArgumentParserError, error:
-            if "-H" in sys.argv or "--help" in sys.argv:  # non cli input?
+            if "-h" in sys.argv or "--help" in sys.argv:  # non cli input?
                 commands = [cmd for (cmd, description) in Commands.methods.iteritems() if description['visible'] is True]
                 command = error.prog.split()[-1]
                 if command in commands:
@@ -303,16 +416,23 @@ class CommandLineParser(object):
                 else:
                     self.parser.print_help()
                 self.parser.exit(2)
+            elif "-v" in sys.argv or "--ver" in sys.argv:
+                print version()
+                self.parser.exit(0)
             else:
                 self.parser.print_usage(sys.stderr)
-                self.parser.exit(2, 'error: %s\n' % (error.error_message))
+                self.parser.exit(2, 'error: %s. Use -h for help.\n' % (error.error_message))
 
         self.cmd = args.command
         self.args = args
         return self.args
 
-    def setup_client(self, host, port, hadoop_version):
-        self.client = Client(host, port, hadoop_version)
+    def setup_client(self):
+        if 'skiptrash' in self.args:
+            use_trash = self.args.usetrash and not self.args.skiptrash
+        else:
+            use_trash = self.args.usetrash
+        self.client = HAClient(self.namenodes, use_trash)
 
     def execute(self):
         if self.args.help:
@@ -324,8 +444,8 @@ class CommandLineParser(object):
             sys.exit(-1)
         try:
             return Commands.methods[self.cmd]['method'](self)
-        except Exception, e:
-            exitError(e)
+        except Exception:
+            exitError(sys.exc_info())
 
     def command(args="", descr="", allowed_opts="", visible=True, req_args=None):
         def wrap(f):
@@ -341,18 +461,19 @@ class CommandLineParser(object):
     def commands(self):
         print "\n".join(sorted([k for k, v in Commands.methods.iteritems() if v['visible']]))
 
-    @command(args="[path]", descr="create directories and their parents", visible=False, req_args=['[dirs]'])
+    @command(args="[path]", descr="Used for command line completion", visible=False, req_args=['[dirs]'])
     def complete(self):
         self.args.summary = True
         self.args.directory = False
         self.args.recurse = False
+        self.args.human = False
         try:
             for line in self._listing():
                 print line.replace(" ", "\\\\ ")
         except FileNotFoundException:
             pass
 
-    @command(args="[paths]", descr="list a path", allowed_opts=["d", "R", "s"], req_args=['[dirs]'])
+    @command(args="[paths]", descr="list a path", allowed_opts=["d", "R", "s", "h"], req_args=['[dirs]'])
     def ls(self):
         for line in self._listing():
             print line
@@ -397,8 +518,8 @@ class CommandLineParser(object):
             mods = self.client.chown(self.args.dir, owner, recurse=self.args.recurse)
             for line in format_results(mods, json_output=self.args.json):
                 print line
-        except FileNotFoundException, e:
-            exitError(e)
+        except FileNotFoundException:
+            exitError(sys.exc_info())
 
     @command(args="<mode> [paths]", descr="change file mode (octal)", allowed_opts=["R"], req_args=['(int) arg', 'dir [dirs]'])
     def chmod(self):
@@ -414,21 +535,21 @@ class CommandLineParser(object):
         for line in format_results(mods, json_output=self.args.json):
             print line
 
-    @command(args="[paths]", descr="display stats for paths", req_args=['[dirs]'])
+    @command(args="[paths]", descr="display stats for paths", allowed_opts=['h'], req_args=['[dirs]'])
     def count(self):
         counts = self.client.count(self.args.dir)
         for line in format_counts(counts, json_output=self.args.json,
                                   human_readable=self.args.human):
             print line
 
-    @command(args="", descr="display fs stats")
+    @command(args="", descr="display fs stats", allowed_opts=['h'])
     def df(self):
         result = self.client.df()
         for line in format_fs_stats(result, json_output=self.args.json,
                                     human_readable=self.args.human):
             print line
 
-    @command(args="[paths]", descr="display disk usage statistics", allowed_opts=["s"], req_args=['[dirs]'])
+    @command(args="[paths]", descr="display disk usage statistics", allowed_opts=["s", "h"], req_args=['[dirs]'])
     def du(self):
         if self.args.summary:
             include_children = False
@@ -448,7 +569,7 @@ class CommandLineParser(object):
         for line in format_results(result, json_output=self.args.json):
             print line
 
-    @command(args="[paths]", descr="remove paths", allowed_opts=["R"], req_args=['dir [dirs]'])
+    @command(args="[paths]", descr="remove paths", allowed_opts=["R", "S", "T"], req_args=['dir [dirs]'])
     def rm(self):
         result = self.client.delete(self.args.dir, recurse=self.args.recurse)
         for line in format_results(result, json_output=self.args.json):
@@ -512,12 +633,18 @@ class CommandLineParser(object):
 
     @command(args="[paths]", descr="stat information", req_args=['dir [dirs]'])
     def stat(self):
-        print format_stat(self.client.stat(self.args.dir))
+        print format_stat(self.client.stat(self.args.dir), json_output=self.args.json)
 
     @command(args="path", descr="test a path", allowed_opts=['d', 'z', 'e'], req_args=['arg'])
     def test(self):
         path = self.args.single_arg
-        if self.client.test(path, exists=self.args.exists, directory=self.args.directory, zero_length=self.args.zero):
+
+        try:
+            result = self.client.test(path, exists=self.args.exists, directory=self.args.directory, zero_length=self.args.zero)
+        except FileNotFoundException:
+            result = False
+
+        if result:
             sys.exit(0)
         else:
             sys.exit(1)
@@ -526,9 +653,9 @@ class CommandLineParser(object):
     def cat(self):
         for file_to_read in self.client.cat(self.args.dir, check_crc=self.args.checkcrc):
             for load in file_to_read:
-                print load
+                sys.stdout.write(load)
 
-    @command(args="path dst", descr="copy local file reference to destination", req_args=['dir [dirs]', 'arg'])
+    @command(args="path dst", descr="copy local file reference to destination", req_args=['dir [dirs]', 'arg'], visible=False)
     def copyFromLocal(self):
         src = self.args.dir
         dst = self.args.single_arg
@@ -544,7 +671,7 @@ class CommandLineParser(object):
         for line in format_results(result, json_output=self.args.json):
             print line
 
-    @command(args="[paths] dst", descr="copy files from source to destination", allowed_opts=['checkcrc'], req_args=['dir [dirs]', 'arg'])
+    @command(args="[paths] dst", descr="copy files from source to destination", allowed_opts=['checkcrc'], req_args=['dir [dirs]', 'arg'], visible=False)
     def cp(self):
         paths = self.args.dir
         dst = self.args.single_arg

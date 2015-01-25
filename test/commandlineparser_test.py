@@ -15,9 +15,17 @@
 import unittest2
 import os
 import pwd
+import json
+import sys
+import traceback
 
-from snakebite.commandlineparser import CommandLineParser
+from mock import MagicMock, patch, mock_open
 
+from snakebite.config import HDFSConfig
+from snakebite.commandlineparser import Commands, CommandLineParser
+from snakebite.namenode import Namenode
+
+from config_test import ConfigTest
 
 class CommandLineParserTest(unittest2.TestCase):
 
@@ -41,11 +49,6 @@ class CommandLineParserTest(unittest2.TestCase):
         output = parser.parse('--debug ls some_folder'.split())
         self.assertTrue(output.debug)
 
-        output = parser.parse('-h ls some_folder'.split())
-        self.assertTrue(output.human)
-        output = parser.parse('--human ls some_folder'.split())
-        self.assertTrue(output.human)
-
         output = parser.parse('-j ls some_folder'.split())
         self.assertTrue(output.json)
         output = parser.parse('--json ls some_folder'.split())
@@ -67,9 +70,8 @@ class CommandLineParserTest(unittest2.TestCase):
         self.assertEqual(output.version, 4)
 
         #all options
-        output = parser.parse('-D -h -j -n namenode_fqdn -p 1234 -V 4 ls some_folder'.split())
+        output = parser.parse('-D -j -n namenode_fqdn -p 1234 -V 4 ls some_folder'.split())
         self.assertTrue(output.debug)
-        self.assertTrue(output.human)
         self.assertTrue(output.json)
         self.assertEqual(output.namenode, "namenode_fqdn")
         self.assertEqual(output.port, 1234)
@@ -98,11 +100,16 @@ class CommandLineParserTest(unittest2.TestCase):
         self.assertEqual(output.dir, ['dir1', 'dir2', 'dir3'])
 
         #specific commands
-        output = parser.parse('ls -d -R -s some_dir'.split())
+        output = parser.parse('ls -d -R -s -h some_dir'.split())
         self.assertTrue(output.directory)
         self.assertTrue(output.recurse)
         self.assertTrue(output.summary)
+        self.assertTrue(output.human)
         self.assertEqual(output.dir, ['some_dir'])
+
+        #multiple slashes
+        output = parser.parse('ls ///dir1 //dir2 /dir3'.split())
+        self.assertEqual(output.dir, ['///dir1', '//dir2', '/dir3'])
 
     def test_mkdir(self):
         parser = self.parser
@@ -228,12 +235,21 @@ class CommandLineParserTest(unittest2.TestCase):
         output = parser.parse('count dir1 dir2 dir3'.split())
         self.assertEqual(output.dir, ['dir1', 'dir2', 'dir3'])
 
+        # Human output
+        output = parser.parse('count -h dir1 dir2 dir3'.split())
+        self.assertTrue(output.human)
+
     def test_df(self):
         parser = self.parser
 
         #no dir
         output = parser.parse('df'.split())
         self.assertEqual(output.command, 'df')
+
+        # Human output
+        output = parser.parse('df -h'.split())
+        self.assertEqual(output.command, 'df')
+        self.assertTrue(output.human)
 
         with self.assertRaises(SystemExit):
             parser.parse('df some_additional_argument'.split())
@@ -257,6 +273,10 @@ class CommandLineParserTest(unittest2.TestCase):
         #summary
         output = parser.parse('du -s some_dir'.split())
         self.assertTrue(output.summary)
+
+        #human
+        output = parser.parse('du -h some_dir'.split())
+        self.assertTrue(output.human)
 
     def test_mv(self):
         parser = self.parser
@@ -297,6 +317,27 @@ class CommandLineParserTest(unittest2.TestCase):
         #recursive
         output = parser.parse('rm -R some_dir'.split())
         self.assertTrue(output.recurse)
+
+        #skiptrash
+        output = parser.parse('rm -S some_dir'.split())
+        self.assertTrue(output.skiptrash)
+
+        #skiptrash
+        output = parser.parse('rm --skiptrash some_dir'.split())
+        self.assertTrue(output.skiptrash)
+
+        #usetrash
+        output = parser.parse('rm -T some_dir'.split())
+        self.assertTrue(output.usetrash)
+
+        #usetrash
+        output =parser.parse('rm --usetrash some_dir'.split())
+        self.assertTrue(output.usetrash)
+
+        #usetrash & skiptrash
+        output = parser.parse('rm --usetrash --skiptrash some_dir'.split())
+        self.assertTrue(output.usetrash)
+        self.assertTrue(output.skiptrash)
 
     def test_touchz(self):
         parser = self.parser
@@ -593,3 +634,440 @@ class CommandLineParserTest(unittest2.TestCase):
         #specific commands
         output = parser.parse('text -checkcrc dir1 dir2'.split())
         self.assertEqual(output.checkcrc, True)
+
+
+
+class MockParseArgs(object):
+    # dir is a list of directories
+    def __init__(self, dir=[],
+                single_arg=None,
+                command=None,
+                namenode=None,
+                port=None,
+                usetrash=False,
+                skiptrash=False):
+        self.dir = dir
+        self.single_arg = single_arg
+        self.command = command
+        self.namenode = namenode
+        self.port = port
+        self.usetrash = usetrash
+        self.skiptrash = skiptrash
+
+    def __contains__(self, b):
+        return b in self.__dict__
+
+class CommandLineParserInternalConfigTest(unittest2.TestCase):
+    def setUp(self):
+        self.parser = CommandLineParser()
+        self.default_dir = os.path.join("/user", pwd.getpwuid(os.getuid())[0])
+
+
+    def assert_namenode_spec(self, host, port, version=None):
+        self.assertEqual(self.parser.args.namenode, host)
+        self.assertEqual(self.parser.args.port, port)
+        if version:
+            self.assertEqual(self.parser.args.version, version)
+
+    def assert_namenodes_spec(self, host, port, version=None):
+        for namenode in self.parser.namenodes:
+            try:
+                self.assertEqual(namenode.host, host)
+                self.assertEqual(namenode.port, port)
+                if version:
+                    self.assertEqual(namenode.version, version)
+            except AssertionError:
+                continue
+            # There was no AssertError -> we found our NN
+            return
+        self.fail("NN not found in namenodes")
+
+
+    def test_cl_config_conflicted(self):
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav",
+                                              "hdfs://foobar2:50070/user/rav"])
+        with self.assertRaises(SystemExit):
+            self.parser.read_config()
+
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50071/user/rav",
+                                              "hdfs://foobar:50070/user/rav"])
+        with self.assertRaises(SystemExit):
+            self.parser.read_config()
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50072/user/rav",
+                                              "hdfs://foobar2:50070/user/rav"])
+        with self.assertRaises(SystemExit):
+            self.parser.read_config()
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav",
+                                              "hdfs://foobar:50070/user/rav"],
+                                         single_arg="hdfs://foobar2:50070/user/rav",
+                                         command="mv")
+        with self.assertRaises(SystemExit):
+            self.parser.read_config()
+
+    def test_cl_config_simple(self):
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav",
+                                              "hdfs://foobar:50070/user/rav2"])
+
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assert_namenodes_spec("foobar", 50070)
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav",
+                                              "hdfs://foobar:50070/user/rav2"],
+                                         single_arg="hdfs://foobar:50070/user/rav",
+                                         command="mv")
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assert_namenodes_spec("foobar", 50070)
+
+    def test_cl_config_slash_madness_check_scheme(self):
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070///user//rav",
+                                              "hdfs://foobar:50070/user/////rav2"])
+
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assert_namenodes_spec("foobar", 50070)
+
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user////rav",
+                                              "hdfs://foobar:50070////user/rav2"],
+                                         single_arg="hdfs://foobar:50070/////user/rav",
+                                         command="mv")
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assert_namenodes_spec("foobar", 50070)
+
+    def test_cl_config_slash_madness_full_check(self):
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar/user////rav",
+                                              "hdfs://foobar////user/rav2"],
+                                         single_arg="hdfs://foobar/////user/rav",
+                                         command="mv")
+        self.parser.init()
+        self.assert_namenode_spec("foobar", Namenode.DEFAULT_PORT)
+        self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT)
+        self.assertIn("/user////rav", self.parser.args.dir)
+        self.assertIn("////user/rav2", self.parser.args.dir)
+        self.assertEqual(self.parser.args.single_arg, "/////user/rav")
+
+    def test_cl_config_reduce_paths(self):
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav",
+                                              "hdfs://foobar:50070/user/rav2"],
+                                         single_arg="hdfs://foobar:50070/user/rav3",
+                                         command="mv")
+        self.parser.init()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assertIn("/user/rav", self.parser.args.dir)
+        self.assertIn("/user/rav2", self.parser.args.dir)
+        self.assertEqual(self.parser.args.single_arg, "/user/rav3")
+
+    import snakebite.config
+    @patch.object(snakebite.config.HDFSConfig, 'get_external_config')
+    @patch("snakebite.commandlineparser.CommandLineParser._read_config_snakebiterc", return_value=None)
+    def test_config_no_config(self, config_mock, read_config_mock):
+        hadoop_home = None
+        config_mock.return_value = []
+        if os.environ.get("HADOOP_HOME"):
+            hadoop_home = os.environ["HADOOP_HOME"]
+            del os.environ["HADOOP_HOME"]
+        self.parser.args = MockParseArgs()
+        with self.assertRaises(SystemExit):
+            self.parser.read_config()
+
+        if hadoop_home:
+            os.environ["HADOOP_HOME"] = hadoop_home
+
+        self.assert_namenode_spec(None, None)
+
+
+    valid_snake_one_rc = {"namenode": "foobar", "version": 9, "port": 54310}
+    valid_snake_ha_rc = [{"namenode": "foobar", "version": 9, "port": 54310},
+                         {"namenode": "foobar2", "version": 9, "port": 54310}]
+
+    invalid_snake_rc = "hdfs://foobar:54310"
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_one_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_one_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", 54310, 9)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_ha_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_ha_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", 54310, 9)
+            self.assert_namenodes_spec("foobar2", 54310, 9)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_invalid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.invalid_snake_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            with self.assertRaises(SystemExit):
+                self.parser.read_config()
+
+    valid_snake_noport_one_rc = {"namenode": "foobar", "version": 11}
+    valid_snake_noport_ha_rc = [{"namenode": "foobar", "version": 100},
+                                {"namenode": "foobar2", "version": 100}]
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_one_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_one_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 11)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_ha_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_ha_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 100)
+            self.assert_namenodes_spec("foobar2", Namenode.DEFAULT_PORT, 100)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+
+    valid_snake_noport_nov_one_rc = {"namenode": "foobar"}
+    valid_snake_noport_nov_ha_rc = [{"namenode": "foobar"},
+                                    {"namenode": "foobar2"}]
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_nov_one_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_nov_one_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_nov_ha_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_nov_ha_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
+            self.assert_namenodes_spec("foobar2", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    valid_snake_noport_mix_rc = [{"namenode": "foobar", "version": 100},
+                                 {"namenode": "foobar2", "port": 66}]
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_mix_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_mix_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 100)
+            self.assert_namenodes_spec("foobar2", 66, Namenode.DEFAULT_VERSION)
+            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+
+    valid_snake_one_rc_v2 = {
+                                "config_version": 2,
+                                "use_trash": False,
+                                "namenodes": [
+                                    {"host": "foobar3", "version": 9, "port": 54310}
+                                ]
+                            }
+
+    valid_snake_ha_rc_v2 = {
+                                "config_version": 2,
+                                "use_trash": True,
+                                "namenodes": [
+                                    {"host": "foobar4", "version": 9, "port": 54310},
+                                    {"host": "foobar5", "version": 9, "port": 54310}
+                                ]
+                            }
+
+    invalid_snake_rc_v2 = "hdfs://foobar:54310"
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_one_valid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_one_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assertFalse(self.parser.args.usetrash)
+            self.assert_namenodes_spec("foobar3", 54310, 9)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_ha_valid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_ha_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assertTrue(self.parser.args.usetrash)
+            self.assert_namenodes_spec("foobar4", 54310, 9)
+            self.assert_namenodes_spec("foobar5", 54310, 9)
+
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_invalid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.invalid_snake_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            with self.assertRaises(SystemExit):
+                self.parser.read_config()
+
+
+    valid_snake_noport_one_rc_v2 = {
+                                    "config_version": 2,
+                                    "use_trash": False,
+                                    "namenodes": [
+                                        {"host": "foobar3", "version": 9}
+                                    ]
+                                   }
+
+    valid_snake_mix_ha_rc_v2 = {
+                                   "config_version": 2,
+                                   "use_trash": True,
+                                   "namenodes": [
+                                        {"host": "foobar4", "version": 100},
+                                        {"host": "foobar5", "port": 54310}
+                                    ]
+                                  }
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_noport_one_valid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_noport_one_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assertFalse(self.parser.args.usetrash)
+            self.assert_namenodes_spec("foobar3", Namenode.DEFAULT_PORT, 9)
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_mix_ha_valid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_mix_ha_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.assertTrue(self.parser.args.usetrash)
+            self.assert_namenodes_spec("foobar4", Namenode.DEFAULT_PORT, 100)
+            self.assert_namenodes_spec("foobar5", 54310, Namenode.DEFAULT_VERSION)
+
+
+    def test_cl_default_port(self):
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar/user/rav"],
+                                         single_arg="hdfs://foobar/user/rav",
+                                         command="mv")
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", Namenode.DEFAULT_PORT)
+
+    def test_cl_trash_setting_preserved_after_cl_config(self):
+        # no snakebiterc
+        # read config from CL
+        self.parser.args = MockParseArgs(dir=["hdfs://foobar:50070/user/rav"],
+                                         skiptrash=True,
+                                         command="rm")
+        self.parser.read_config()
+        self.assert_namenode_spec("foobar", 50070)
+        self.assert_namenodes_spec("foobar", 50070)
+        self.assertEquals(self.parser.args.skiptrash, True)
+
+    def _revert_hdfs_try_paths(self):
+        # Make sure HDFSConfig is in vanilla state
+        HDFSConfig.use_trash = False
+        HDFSConfig.hdfs_try_paths = ConfigTest.original_hdfs_try_path
+        HDFSConfig.core_try_paths = ConfigTest.original_core_try_path
+
+    @patch("os.path.exists")
+    def test_cl_trash_setting_preserved_after_snakebiterc_one_valid(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_snake_one_rc))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs(usetrash=True)
+            self.parser.read_config()
+            self.assert_namenodes_spec("foobar", 54310, 9)
+            self.assertTrue(self.parser.args.usetrash)
+
+
+    @patch('os.environ.get')
+    def test_cl_usetrash_setting_preserved_after_external_nontrash_config(self, environ_get):
+        environ_get.return_value = False
+        # no snakebiterc
+        # read external config (hdfs-site, core-site)
+        self.parser.args = MockParseArgs(dir=["/user/rav/test"],
+                                         usetrash=True,
+                                         command="rm")
+        try:
+            HDFSConfig.core_try_paths = (ConfigTest.get_config_path('ha-core-site.xml'),)
+            HDFSConfig.hdfs_try_paths = (ConfigTest.get_config_path('ha-noport-hdfs-site.xml'),)
+            self.parser.init()
+
+            self.assertTrue(self.parser.args.usetrash)
+            self.assertTrue(self.parser.client.use_trash)
+        finally:
+            self._revert_hdfs_try_paths()
+
+    @patch('os.environ.get')
+    def test_cl_skiptrash_setting_preserved_after_external_nontrash_config(self, environ_get):
+        environ_get.return_value = False
+        # no snakebiterc
+        # read external config (hdfs-site, core-site)
+        self.parser.args = MockParseArgs(dir=["/user/rav/test"],
+                                         skiptrash=True,
+                                         usetrash=True,
+                                         command="rm")
+        try:
+            HDFSConfig.core_try_paths = (ConfigTest.get_config_path('ha-core-site.xml'),)
+            HDFSConfig.hdfs_try_paths = (ConfigTest.get_config_path('ha-noport-hdfs-site.xml'),)
+            self.parser.init()
+
+            self.assertTrue(self.parser.args.skiptrash)
+            self.assertTrue(self.parser.args.usetrash)
+            self.assertFalse(self.parser.client.use_trash)
+        finally:
+            self._revert_hdfs_try_paths()
+
+
+
+class CommandLineParserExecuteTest(unittest2.TestCase):
+    def test_execute_does_not_swallow_tracebacks(self):
+        with patch.dict(Commands.methods, clear=True):
+            @CommandLineParser.command.im_func()
+            def boom(*args, **kwargs):
+                def subboom():
+                    raise IndexError("Boom!")
+                subboom()
+
+            parser = CommandLineParser()
+            parser.parse(["boom"])
+
+            try:
+                parser.execute()
+            except IndexError:
+                _, _, exc_traceback = sys.exc_info()
+                self.assertIn(
+                    "subboom()\n",
+                    traceback.format_exc(),
+                    msg="Lost some stack frames when re-raising!",
+                )
+            else:
+                self.fail("execute() should have raised an IndexError!")
